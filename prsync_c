@@ -91,6 +91,24 @@ if [ "${TOTAL_FILES}" -eq "0" ]; then
   exit 0
 fi
 
+# Extract directories and create them before starting transfers
+echo -e "${GREEN}INFO: Extracting directories and creating them...${NC}"
+
+# Extract all directories from files.all - look for entries ending with /
+grep '/$' "${TMPDIR}/files.all" | awk '{print $2}' > "${TMPDIR}/dirs.list"
+
+# Create the directories in the destination
+while read -r dir; do
+  mkdir -p "${DEST_ARG}/${dir}"
+  echo -e "${GREEN}INFO: Created directory: ${DEST_ARG}/${dir}${NC}"
+done < "${TMPDIR}/dirs.list"
+
+# Remove the directories from files.all to avoid duplicate transfers
+grep -v '/$' "${TMPDIR}/files.all" > "${TMPDIR}/files.filtered"
+mv "${TMPDIR}/files.filtered" "${TMPDIR}/files.all"
+
+echo -e "${GREEN}INFO: Directories created, proceeding with file distribution...${NC}"
+
 function array_min {
   ARR=("$@")
   # Default index for min value
@@ -195,8 +213,8 @@ for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
     SRC="${CURRENT_HOST_NUM}:${SOURCE_PATH}"
   fi
 
-  # Build the command - only add bwlimit if BANDWIDTH_PER_TRANSFER is set
-  CMD="rsync --files-from=${CHUNK_FILE}"
+  # Build the command with --no-dirs to avoid directory creation
+  CMD="rsync --files-from=${CHUNK_FILE} --no-dirs"
 
   # Add bandwidth limit only if specified
   if [ -n "$BANDWIDTH_PER_TRANSFER" ]; then
