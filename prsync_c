@@ -7,7 +7,7 @@ set -e
 # Options:
 #   --parallel=N         Use N parallel processes for transfer.
 #   --hosts=START_INDEX  Starting index for hosts. Will use hosts START_INDEX through START_INDEX+N-1.
-#   --total_bw=MBPS      Total bandwidth in Mbps to distribute across transfers (default: 900).
+#   --total_bw=MBPS      Total bandwidth in Mbps to distribute across transfers (optional).
 #
 # Notes:
 #   * Requires GNU Parallel
@@ -48,24 +48,28 @@ else
   exit 1
 fi
 
-# Set default total bandwidth (Mbps)
-TOTAL_BW_MBPS=900
-
 # Process total bandwidth if provided
+TOTAL_BW_MBPS=""
+BANDWIDTH_PER_TRANSFER=""
+
 if [[ "$1" == --total_bw=* ]]; then
   TOTAL_BW_MBPS="${1##*=}"
+  # Calculate bandwidth limit per transfer
+  # Convert Mbps to KB/s: Mbps ÷ 8 × 1024 = KB/s
+  TOTAL_BANDWIDTH=$((TOTAL_BW_MBPS * 1024 / 8))  # Convert Mbps to KB/s
+  BANDWIDTH_PER_TRANSFER=$((TOTAL_BANDWIDTH / PARALLEL_RSYNC))
   shift
 fi
 
-# Calculate bandwidth limit per transfer
-# Convert Mbps to KB/s: Mbps ÷ 8 × 1024 = KB/s
-TOTAL_BANDWIDTH=$((TOTAL_BW_MBPS * 1024 / 8))  # Convert Mbps to KB/s
-BANDWIDTH_PER_TRANSFER=$((TOTAL_BANDWIDTH / PARALLEL_RSYNC))
-
 echo -e "${GREEN}INFO: Using up to ${PARALLEL_RSYNC} processes for transfer ...${NC}"
 echo -e "${GREEN}INFO: Using hosts ${HOST_START_INDEX} through $((HOST_START_INDEX + PARALLEL_RSYNC - 1)) ...${NC}"
-echo -e "${GREEN}INFO: Total bandwidth: ${TOTAL_BW_MBPS} Mbps (${TOTAL_BANDWIDTH} KB/s)${NC}"
-echo -e "${GREEN}INFO: Bandwidth per transfer: ${BANDWIDTH_PER_TRANSFER} KB/s${NC}"
+
+if [ -n "$TOTAL_BW_MBPS" ]; then
+  echo -e "${GREEN}INFO: Total bandwidth: ${TOTAL_BW_MBPS} Mbps (${TOTAL_BANDWIDTH} KB/s)${NC}"
+  echo -e "${GREEN}INFO: Bandwidth per transfer: ${BANDWIDTH_PER_TRANSFER} KB/s${NC}"
+else
+  echo -e "${GREEN}INFO: Bandwidth limiting disabled${NC}"
+fi
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
@@ -191,8 +195,16 @@ for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
     SRC="${CURRENT_HOST_NUM}:${SOURCE_PATH}"
   fi
 
-  # Build the full command
-  CMD="rsync --files-from=${CHUNK_FILE} --bwlimit=${BANDWIDTH_PER_TRANSFER} ${RSYNC_OPTS[*]} ${SRC} ${DEST_ARG}"
+  # Build the command - only add bwlimit if BANDWIDTH_PER_TRANSFER is set
+  CMD="rsync --files-from=${CHUNK_FILE}"
+
+  # Add bandwidth limit only if specified
+  if [ -n "$BANDWIDTH_PER_TRANSFER" ]; then
+    CMD="${CMD} --bwlimit=${BANDWIDTH_PER_TRANSFER}"
+  fi
+
+  # Add the remaining options
+  CMD="${CMD} ${RSYNC_OPTS[*]} ${SRC} ${DEST_ARG}"
   COMMANDS+=("$CMD")
 done
 
