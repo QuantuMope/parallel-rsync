@@ -1,8 +1,7 @@
 #!/bin/bash
 set -e
-# Inspired by https://gist.github.com/akorn/644855ddaa8065f564be
 # Usage:
-#   rsync_parallel.sh --parallel=N --hosts=START_INDEX [--total_bw=MBPS] [rsync args...]
+#   queue_rsync.sh --parallel=N --hosts=START_INDEX [--total_bw=MBPS] [rsync args...]
 #
 # Options:
 #   --parallel=N         Use N parallel processes for transfer.
@@ -10,24 +9,26 @@ set -e
 #   --total_bw=MBPS      Total bandwidth in Mbps to distribute across transfers (optional).
 #
 # Notes:
-#   * Requires GNU Parallel
+#   * Requires GNU Parallel and flock for safe queue operations
 #   * Supports both remote-to-local and local-to-remote transfers
+#   * Uses a queue-based approach instead of pre-chunking for better load balancing
 #   * Assumes SSH keys are already configured for all hosts
-#   * Does an itemize-changes first, then chunks the resulting file list and launches N parallel
-#     rsyncs to transfer a chunk each.
-#   * be a little careful with the options you pass through to rsync. Normal ones will work, you
-#     might want to test weird options upfront.
-#   * Make sure your SSH config has the sequential hosts defined properly.
-#
+#   * Be careful with the options you pass through to rsync.
+
 # Define colours for STDERR text
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 ORANGE='\033[0;33m'
 NC='\033[0m' # No Color
 
-if ! command -v parallel &> /dev/null
-then
+# Check for required commands
+if ! command -v parallel &> /dev/null; then
   echo -e "${RED}parallel could not be found${NC}"
+  exit 1
+fi
+
+if ! command -v flock &> /dev/null; then
+  echo -e "${RED}flock could not be found${NC}"
   exit 1
 fi
 
@@ -138,6 +139,7 @@ else
   exit 1
 fi
 
+# Create a temporary directory for our queue files
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
 echo -e "${GREEN}INFO: Determining file list for transfer ...${NC}"
@@ -167,97 +169,140 @@ if [ "${TOTAL_FILES}" -eq "0" ]; then
   exit 0
 fi
 
-# Remove the directories from files.all to avoid duplicate transfers
+# Remove directories from files.all
 grep -v '/$' "${TMPDIR}/files.all" > "${TMPDIR}/files.filtered"
 mv "${TMPDIR}/files.filtered" "${TMPDIR}/files.all"
 
-echo -e "${GREEN}INFO: Proceeding with file distribution...${NC}"
+# Ensure the destination directory exists only once
+if [ "$IS_UPLOAD" = true ]; then
+  # For upload, ensure the destination directory exists on the first host
+  if [[ -n "$REMOTE_USER" ]]; then
+    SSH_DEST="${REMOTE_USER}@$((HOST_START_INDEX))"
+  else
+    SSH_DEST="$((HOST_START_INDEX))"
+  fi
 
-function array_min {
-  ARR=("$@")
-  # Default index for min value
-  min_i=0
-  # Default min value
-  min_v=${ARR[$min_i]}
-  for i in "${!ARR[@]}"; do
-    v="${ARR[$i]}"
-    (( v < min_v )) && min_v=${v} && min_i=${i}
+  # Make sure the destination directory exists
+  ssh $SSH_DEST "mkdir -p '${REMOTE_PATH}'"
+  echo -e "${GREEN}INFO: Ensured destination directory exists on first host${NC}"
+fi
+
+# Create a batch file for each server
+for ((i=0; i<PARALLEL_RSYNC; i++)); do
+  touch "${TMPDIR}/batch.${i}"
+done
+
+# Initialize file queue
+echo -e "${GREEN}INFO: Creating file queue...${NC}"
+cp "${TMPDIR}/files.all" "${TMPDIR}/queue"
+
+# Create a lockfile for queue access
+touch "${TMPDIR}/queue.lock"
+
+# Create worker function for parallel processing
+worker_function() {
+  HOST_NUM=$1
+  BATCH_FILE="${TMPDIR}/batch.${HOST_NUM}"
+  # Restore RSYNC_OPTS array from the serialized string
+  eval "$RSYNC_OPTS_STR"
+
+  # Generate remote path based on direction
+  if [[ -n "$REMOTE_USER" ]]; then
+    REMOTE="${REMOTE_USER}@${HOST_NUM}"
+  else
+    REMOTE="${HOST_NUM}"
+  fi
+
+  # Number of files to process in each batch (adjust as needed)
+  BATCH_SIZE=10
+  TOTAL_PROCESSED=0
+
+  while true; do
+    # Get a batch of files from the queue using flock to ensure exclusive access
+    flock "${TMPDIR}/queue.lock" bash -c "
+      if [ -s \"${TMPDIR}/queue\" ]; then
+        head -n ${BATCH_SIZE} \"${TMPDIR}/queue\" > \"${BATCH_FILE}\"
+        sed -i \"1,${BATCH_SIZE}d\" \"${TMPDIR}/queue\"
+        echo 'got_files'
+      else
+        echo 'queue_empty'
+      fi
+    " > "${TMPDIR}/status.${HOST_NUM}"
+
+    STATUS=$(cat "${TMPDIR}/status.${HOST_NUM}")
+
+    if [ "$STATUS" = "queue_empty" ]; then
+      echo -e "${GREEN}Host ${HOST_NUM}: Completed ${TOTAL_PROCESSED} files${NC}"
+      break
+    fi
+
+    # Count files in this batch
+    BATCH_COUNT=$(wc -l < "${BATCH_FILE}")
+    TOTAL_PROCESSED=$((TOTAL_PROCESSED + BATCH_COUNT))
+
+    # Extract just the filenames (no sizes)
+    awk '{print $2}' "${BATCH_FILE}" > "${BATCH_FILE}.names"
+
+    # Build rsync command
+    CMD="rsync --files-from=${BATCH_FILE}.names"
+
+    # Add bandwidth limit if specified
+    if [ -n "$BANDWIDTH_PER_TRANSFER" ]; then
+      CMD="${CMD} --bwlimit=${BANDWIDTH_PER_TRANSFER}"
+    fi
+
+    # Add the remaining options
+    CMD="${CMD} ${RSYNC_OPTS[*]}"
+
+    if [ "$IS_UPLOAD" = true ]; then
+      # For upload, transfer from local to remote host
+      CMD="${CMD} ${LOCAL_ARG} ${REMOTE}:${REMOTE_PATH}"
+    else
+      # For download, transfer from remote host to local
+      CMD="${CMD} ${REMOTE}:${REMOTE_PATH} ${LOCAL_ARG}"
+    fi
+
+    # Execute the rsync command
+    $CMD
+
+    # Small delay to prevent overwhelming the system
+    sleep 0.1
   done
-  MIN_I="${min_i}"
 }
 
-echo -e "${GREEN}INFO: Distributing files among chunks ...${NC}"
-# declare chunk-size array
-for ((I = 0 ; I < PARALLEL_RSYNC ; I++ )); do
-  CHUNKS["${I}"]=0
-done
-
-# add each file to the emptiest chunk, so they're as balanced by size as possible
-PROGRESS=0
+echo -e "${GREEN}INFO: Starting transfer with dynamic queue...${NC}"
 SECONDS=0
-while read -r FSIZE FPATH; do
-  PROGRESS=$((PROGRESS+1))
-  array_min "${CHUNKS[@]}"
-  CHUNKS[MIN_I]=$(( CHUNKS[MIN_I] + FSIZE ))
-  echo "${FPATH}" >> "${TMPDIR}/chunk.${MIN_I}"
-  if ! ((PROGRESS % 25000)); then
-    >&2 echo -e "${GREEN}INFO: ${PROGRESS} of ${TOTAL_FILES} (${SECONDS}s)${NC}"
-  fi
-done < "${TMPDIR}/files.all"
 
-# Reverse the list of files in every other chunk for better transfer efficiency
-for ((I = 1 ; I < PARALLEL_RSYNC ; I+=2 )); do
-  # If the list of files to transfer is small, we may not have any files to work with
-  if [ ! -f "${TMPDIR}/chunk.${I}" ]; then
-    continue
-  fi
+# Export the function for use with parallel
+export -f worker_function
+export TMPDIR
+export REMOTE_PATH
+export REMOTE
+export LOCAL_ARG
+export IS_UPLOAD
+export REMOTE_USER
+export BANDWIDTH_PER_TRANSFER
+export GREEN
+RSYNC_OPTS_STR=$(declare -p RSYNC_OPTS)
+export RSYNC_OPTS_STR
 
-  tac "${TMPDIR}/chunk.${I}" > "${TMPDIR}/chunk.${I}.r" && mv "${TMPDIR}/chunk.${I}.r" "${TMPDIR}/chunk.${I}"
-done
-echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
-
-echo -e "${GREEN}INFO: Starting transfers ...${NC}"
-
-# Create commands for parallel
-COMMANDS=()
-CHUNK_FILES=($(find "${TMPDIR}" -type f -name "chunk.*"))
-for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
-  CHUNK_FILE="${CHUNK_FILES[$i]}"
-  CURRENT_HOST_NUM=$((HOST_START_INDEX + i))
-
-  # Build the command with --files-from and --no-dirs
-  CMD="rsync --files-from=${CHUNK_FILE} --no-dirs"
-
-  # Add bandwidth limit if specified
-  if [ -n "$BANDWIDTH_PER_TRANSFER" ]; then
-    CMD="${CMD} --bwlimit=${BANDWIDTH_PER_TRANSFER}"
-  fi
-
-  # Add the remaining options
-  CMD="${CMD} ${RSYNC_OPTS[*]}"
-
-  if [ "$IS_UPLOAD" = true ]; then
-    # For upload, we're connecting to different destination hosts
-    if [[ -n "$REMOTE_USER" ]]; then
-      DEST="${REMOTE_USER}@${CURRENT_HOST_NUM}:${REMOTE_PATH}"
-    else
-      DEST="${CURRENT_HOST_NUM}:${REMOTE_PATH}"
-    fi
-    CMD="${CMD} ${LOCAL_ARG} ${DEST}"
-  else
-    # For download, we're connecting to different source hosts
-    if [[ -n "$REMOTE_USER" ]]; then
-      SRC="${REMOTE_USER}@${CURRENT_HOST_NUM}:${REMOTE_PATH}"
-    else
-      SRC="${CURRENT_HOST_NUM}:${REMOTE_PATH}"
-    fi
-    CMD="${CMD} ${SRC} ${LOCAL_ARG}"
-  fi
-
-  COMMANDS+=("$CMD")
+# Generate the sequence of host numbers
+HOSTS=()
+for ((i=0; i<PARALLEL_RSYNC; i++)); do
+  HOSTS+=($((HOST_START_INDEX + i)))
 done
 
-# Use parallel to run all commands
-echo -e "${GREEN}INFO: Running ${#COMMANDS[@]} rsync jobs in parallel...${NC}"
-printf '%s\n' "${COMMANDS[@]}" | parallel -j "${PARALLEL_RSYNC}" --verbose --progress
-echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
+# Execute the worker function in parallel
+echo -e "${GREEN}INFO: Starting ${PARALLEL_RSYNC} worker processes...${NC}"
+printf '%s\n' "${HOSTS[@]}" | parallel -j "${PARALLEL_RSYNC}" --verbose --progress worker_function
+
+echo -e "${GREEN}INFO: All transfers completed in ${SECONDS}s${NC}"
+
+# Verify if queue is empty
+if [ -s "${TMPDIR}/queue" ]; then
+  REMAINING=$(wc -l < "${TMPDIR}/queue")
+  echo -e "${ORANGE}WARN: ${REMAINING} files left in queue! Transfer may have been incomplete.${NC}"
+  exit 1
+else
+  echo -e "${GREEN}SUCCESS: All files transferred successfully!${NC}"
+fi
