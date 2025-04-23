@@ -2,11 +2,12 @@
 set -e
 # Inspired by https://gist.github.com/akorn/644855ddaa8065f564be
 # Usage:
-#   rsync_parallel.sh --parallel=N --hosts=START_INDEX [rsync args...]
+#   rsync_parallel.sh --parallel=N --hosts=START_INDEX [--total_bw=MBPS] [rsync args...]
 #
 # Options:
 #   --parallel=N         Use N parallel processes for transfer.
 #   --hosts=START_INDEX  Starting index for hosts. Will use hosts START_INDEX through START_INDEX+N-1.
+#   --total_bw=MBPS      Total bandwidth in Mbps to distribute across transfers (default: 900).
 #
 # Notes:
 #   * Requires GNU Parallel
@@ -47,8 +48,24 @@ else
   exit 1
 fi
 
+# Set default total bandwidth (Mbps)
+TOTAL_BW_MBPS=900
+
+# Process total bandwidth if provided
+if [[ "$1" == --total_bw=* ]]; then
+  TOTAL_BW_MBPS="${1##*=}"
+  shift
+fi
+
+# Calculate bandwidth limit per transfer
+# Convert Mbps to KB/s: Mbps ÷ 8 × 1024 = KB/s
+TOTAL_BANDWIDTH=$((TOTAL_BW_MBPS * 1024 / 8))  # Convert Mbps to KB/s
+BANDWIDTH_PER_TRANSFER=$((TOTAL_BANDWIDTH / PARALLEL_RSYNC))
+
 echo -e "${GREEN}INFO: Using up to ${PARALLEL_RSYNC} processes for transfer ...${NC}"
 echo -e "${GREEN}INFO: Using hosts ${HOST_START_INDEX} through $((HOST_START_INDEX + PARALLEL_RSYNC - 1)) ...${NC}"
+echo -e "${GREEN}INFO: Total bandwidth: ${TOTAL_BW_MBPS} Mbps (${TOTAL_BANDWIDTH} KB/s)${NC}"
+echo -e "${GREEN}INFO: Bandwidth per transfer: ${BANDWIDTH_PER_TRANSFER} KB/s${NC}"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
@@ -160,8 +177,8 @@ for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
   # Calculate the host number based on the start index
   CURRENT_HOST_NUM=$((HOST_START_INDEX + i))
 
-  # Build the rsync command
-  RSYNC_CMD=(rsync --files-from="${CHUNK_FILE}")
+  # Build the rsync command with bandwidth limit
+  RSYNC_CMD=(rsync --files-from="${CHUNK_FILE}" --bwlimit="${BANDWIDTH_PER_TRANSFER}")
 
   # Add other rsync options
   for arg in "$@"; do
