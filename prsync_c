@@ -11,6 +11,7 @@ set -e
 #
 # Notes:
 #   * Requires GNU Parallel
+#   * Supports both remote-to-local and local-to-remote transfers
 #   * Assumes SSH keys are already configured for all hosts
 #   * Does an itemize-changes first, then chunks the resulting file list and launches N parallel
 #     rsyncs to transfer a chunk each.
@@ -20,8 +21,8 @@ set -e
 #
 # Define colours for STDERR text
 RED='\033[0;31m'
-ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
+ORANGE='\033[0;33m'
 NC='\033[0m' # No Color
 
 if ! command -v parallel &> /dev/null
@@ -71,15 +72,90 @@ else
   echo -e "${GREEN}INFO: Bandwidth limiting disabled${NC}"
 fi
 
+# Extract source and destination arguments
+SOURCE_ARG=""
+DEST_ARG=""
+RSYNC_OPTS=()
+
+# Store all remaining arguments
+REMAINING_ARGS=("$@")
+
+# First, identify remote paths (containing a colon)
+REMOTE_PATHS=()
+for arg in "${REMAINING_ARGS[@]}"; do
+  if [[ "$arg" =~ : ]]; then
+    REMOTE_PATHS+=("$arg")
+  fi
+done
+
+# Check that there is exactly one remote path
+if [[ ${#REMOTE_PATHS[@]} -ne 1 ]]; then
+  echo -e "${RED}ERROR: Exactly one remote path must be specified (found ${#REMOTE_PATHS[@]})${NC}"
+  exit 1
+fi
+
+# The source and destination should be the last two arguments
+for ((i=0; i<${#REMAINING_ARGS[@]}; i++)); do
+  if [[ $i -lt $(( ${#REMAINING_ARGS[@]} - 2 )) ]]; then
+    RSYNC_OPTS+=("${REMAINING_ARGS[$i]}")
+  elif [[ $i -eq $(( ${#REMAINING_ARGS[@]} - 2 )) ]]; then
+    SOURCE_ARG="${REMAINING_ARGS[$i]}"
+  else
+    DEST_ARG="${REMAINING_ARGS[$i]}"
+  fi
+done
+
+# Check if source or destination is the remote path
+IS_UPLOAD=false
+if [[ "$SOURCE_ARG" =~ : ]]; then
+  # Remote to local (download)
+  REMOTE_ARG="$SOURCE_ARG"
+  LOCAL_ARG="$DEST_ARG"
+  IS_UPLOAD=false
+  echo -e "${GREEN}INFO: Detected DOWNLOAD operation (remote to local)${NC}"
+elif [[ "$DEST_ARG" =~ : ]]; then
+  # Local to remote (upload)
+  REMOTE_ARG="$DEST_ARG"
+  LOCAL_ARG="$SOURCE_ARG"
+  IS_UPLOAD=true
+  echo -e "${GREEN}INFO: Detected UPLOAD operation (local to remote)${NC}"
+else
+  echo -e "${RED}ERROR: Could not identify remote path. Format should be [user@]host:/path${NC}"
+  exit 1
+fi
+
+# Parse the remote argument
+if [[ "$REMOTE_ARG" =~ ^([^@]+@)?([^:]+):(.+)$ ]]; then
+  if [[ -n "${BASH_REMATCH[1]}" ]]; then
+    REMOTE_USER="${BASH_REMATCH[1]%@}"
+  else
+    REMOTE_USER="" # No user specified
+  fi
+  REMOTE_HOST="${BASH_REMATCH[2]}"
+  REMOTE_PATH="${BASH_REMATCH[3]}"
+else
+  echo -e "${RED}ERROR: Could not parse remote path. Format should be [user@]host:/path${NC}"
+  exit 1
+fi
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
 echo -e "${GREEN}INFO: Determining file list for transfer ...${NC}"
 
-# sorted by size (descending)
-rsync "$@" --out-format="%l %n" --no-v --dry-run 2> /dev/null \
-  | grep -v "sending incremental file list" \
-  | sort --numeric-sort --reverse \
-  > "${TMPDIR}/files.all"
+# For both upload and download, we need to get the file list
+if [ "$IS_UPLOAD" = true ]; then
+  # For upload, source is local
+  rsync "${RSYNC_OPTS[@]}" --out-format="%l %n" --no-v --dry-run "$SOURCE_ARG" "$DEST_ARG" 2> /dev/null \
+    | grep -v "sending incremental file list" \
+    | sort --numeric-sort --reverse \
+    > "${TMPDIR}/files.all"
+else
+  # For download, source is remote
+  rsync "${RSYNC_OPTS[@]}" --out-format="%l %n" --no-v --dry-run "$SOURCE_ARG" "$DEST_ARG" 2> /dev/null \
+    | grep -v "sending incremental file list" \
+    | sort --numeric-sort --reverse \
+    > "${TMPDIR}/files.all"
+fi
 
 # check for nothing-to-do
 TOTAL_FILES=$(wc -l < "${TMPDIR}/files.all")
@@ -91,23 +167,11 @@ if [ "${TOTAL_FILES}" -eq "0" ]; then
   exit 0
 fi
 
-## Extract directories and create them before starting transfers
-#echo -e "${GREEN}INFO: Extracting directories and creating them...${NC}"
-#
-## Extract all directories from files.all - look for entries ending with /
-#grep '/$' "${TMPDIR}/files.all" | awk '{print $2}' > "${TMPDIR}/dirs.list"
-#
-## Create the directories in the destination
-#while read -r dir; do
-#  mkdir -p "${DEST_ARG}/${dir}"
-#  echo -e "${GREEN}INFO: Created directory: ${DEST_ARG}/${dir}${NC}"
-#done < "${TMPDIR}/dirs.list"
-
 # Remove the directories from files.all to avoid duplicate transfers
 grep -v '/$' "${TMPDIR}/files.all" > "${TMPDIR}/files.filtered"
 mv "${TMPDIR}/files.filtered" "${TMPDIR}/files.all"
 
-echo -e "${GREEN}INFO: Directories created, proceeding with file distribution...${NC}"
+echo -e "${GREEN}INFO: Proceeding with file distribution...${NC}"
 
 function array_min {
   ARR=("$@")
@@ -154,52 +218,6 @@ echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
 
 echo -e "${GREEN}INFO: Starting transfers ...${NC}"
 
-# Extract information from source argument
-SOURCE_ARG=""
-DEST_ARG=""
-for arg in "$@"; do
-  if [[ "$arg" =~ : ]] && [[ -z "$SOURCE_ARG" ]]; then
-    SOURCE_ARG="$arg"
-  elif [[ -z "$SOURCE_ARG" ]]; then
-    # Not the source yet
-    :
-  elif [[ -z "$DEST_ARG" ]]; then
-    DEST_ARG="$arg"
-    break
-  fi
-done
-
-# If source argument not found, try to determine it from the position
-if [[ -z "$SOURCE_ARG" ]] && [[ $# -ge 2 ]]; then
-  SOURCE_ARG="${@: -2:1}"
-  DEST_ARG="${@: -1}"
-fi
-
-if [[ -z "$SOURCE_ARG" ]] || [[ -z "$DEST_ARG" ]]; then
-  echo -e "${RED}ERROR: Could not determine source and destination arguments${NC}"
-  exit 1
-fi
-
-# Extract path from source
-if [[ "$SOURCE_ARG" =~ ^([^@]+@)?([^:]+):(.+)$ ]]; then
-  if [[ -n "${BASH_REMATCH[1]}" ]]; then
-    SOURCE_USER="${BASH_REMATCH[1]%@}"
-  fi
-  SOURCE_HOST="${BASH_REMATCH[2]}"
-  SOURCE_PATH="${BASH_REMATCH[3]}"
-else
-  echo -e "${RED}ERROR: Could not parse source path. Format should be [user@]host:/path${NC}"
-  exit 1
-fi
-
-# Build the common rsync options
-RSYNC_OPTS=()
-for arg in "$@"; do
-  if [[ "$arg" != "$SOURCE_ARG" ]] && [[ "$arg" != "$DEST_ARG" ]]; then
-    RSYNC_OPTS+=("$arg")
-  fi
-done
-
 # Create commands for parallel
 COMMANDS=()
 CHUNK_FILES=($(find "${TMPDIR}" -type f -name "chunk.*"))
@@ -207,22 +225,35 @@ for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
   CHUNK_FILE="${CHUNK_FILES[$i]}"
   CURRENT_HOST_NUM=$((HOST_START_INDEX + i))
 
-  if [[ -n "$SOURCE_USER" ]]; then
-    SRC="${SOURCE_USER}@${CURRENT_HOST_NUM}:${SOURCE_PATH}"
-  else
-    SRC="${CURRENT_HOST_NUM}:${SOURCE_PATH}"
-  fi
-
-  # Build the command with --no-dirs to avoid directory creation
+  # Build the command with --files-from and --no-dirs
   CMD="rsync --files-from=${CHUNK_FILE} --no-dirs"
 
-  # Add bandwidth limit only if specified
+  # Add bandwidth limit if specified
   if [ -n "$BANDWIDTH_PER_TRANSFER" ]; then
     CMD="${CMD} --bwlimit=${BANDWIDTH_PER_TRANSFER}"
   fi
 
   # Add the remaining options
-  CMD="${CMD} ${RSYNC_OPTS[*]} ${SRC} ${DEST_ARG}"
+  CMD="${CMD} ${RSYNC_OPTS[*]}"
+
+  if [ "$IS_UPLOAD" = true ]; then
+    # For upload, we're connecting to different destination hosts
+    if [[ -n "$REMOTE_USER" ]]; then
+      DEST="${REMOTE_USER}@${CURRENT_HOST_NUM}:${REMOTE_PATH}"
+    else
+      DEST="${CURRENT_HOST_NUM}:${REMOTE_PATH}"
+    fi
+    CMD="${CMD} ${LOCAL_ARG} ${DEST}"
+  else
+    # For download, we're connecting to different source hosts
+    if [[ -n "$REMOTE_USER" ]]; then
+      SRC="${REMOTE_USER}@${CURRENT_HOST_NUM}:${REMOTE_PATH}"
+    else
+      SRC="${CURRENT_HOST_NUM}:${REMOTE_PATH}"
+    fi
+    CMD="${CMD} ${SRC} ${LOCAL_ARG}"
+  fi
+
   COMMANDS+=("$CMD")
 done
 
