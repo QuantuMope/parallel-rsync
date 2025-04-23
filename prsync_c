@@ -170,36 +170,33 @@ else
   exit 1
 fi
 
-# Generate rsync commands for each chunk using sequential hosts
+# Build the common rsync options
+RSYNC_OPTS=()
+for arg in "$@"; do
+  if [[ "$arg" != "$SOURCE_ARG" ]] && [[ "$arg" != "$DEST_ARG" ]]; then
+    RSYNC_OPTS+=("$arg")
+  fi
+done
+
+# Create commands for parallel
+COMMANDS=()
 CHUNK_FILES=($(find "${TMPDIR}" -type f -name "chunk.*"))
 for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
   CHUNK_FILE="${CHUNK_FILES[$i]}"
-  # Calculate the host number based on the start index
   CURRENT_HOST_NUM=$((HOST_START_INDEX + i))
 
-  # Build the rsync command with bandwidth limit
-  RSYNC_CMD=(rsync --files-from="${CHUNK_FILE}" --bwlimit="${BANDWIDTH_PER_TRANSFER}")
-
-  # Add other rsync options
-  for arg in "$@"; do
-    if [[ "$arg" != "$SOURCE_ARG" ]] && [[ "$arg" != "$DEST_ARG" ]]; then
-      RSYNC_CMD+=("$arg")
-    fi
-  done
-
-  # Add source and destination with the current sequential host
   if [[ -n "$SOURCE_USER" ]]; then
-    RSYNC_CMD+=("${SOURCE_USER}@${CURRENT_HOST_NUM}:${SOURCE_PATH}" "${DEST_ARG}")
+    SRC="${SOURCE_USER}@${CURRENT_HOST_NUM}:${SOURCE_PATH}"
   else
-    RSYNC_CMD+=("${CURRENT_HOST_NUM}:${SOURCE_PATH}" "${DEST_ARG}")
+    SRC="${CURRENT_HOST_NUM}:${SOURCE_PATH}"
   fi
 
-  # Execute rsync command
-  echo "${RSYNC_CMD[@]}"
-  "${RSYNC_CMD[@]}" &
+  # Build the full command
+  CMD="rsync --files-from=${CHUNK_FILE} --bwlimit=${BANDWIDTH_PER_TRANSFER} ${RSYNC_OPTS[*]} ${SRC} ${DEST_ARG}"
+  COMMANDS+=("$CMD")
 done
 
-# Wait for all background processes to finish
-wait
-
+# Use parallel to run all commands
+echo -e "${GREEN}INFO: Running ${#COMMANDS[@]} rsync jobs in parallel...${NC}"
+printf '%s\n' "${COMMANDS[@]}" | parallel -j "${PARALLEL_RSYNC}" --verbose --progress
 echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
