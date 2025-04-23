@@ -1,3 +1,36 @@
+# Parallel rsync to rapidly upload and download data from shared folders from the cluster
+
+First, create an alias in your `~/.bashrc`:
+```bash
+alias prsync_c="/path/to/prsync_c"
+```
+
+Make sure to update your `.ssh/config` with all the cluster addresses like so
+```bash
+Host 0
+    HostName 39.105.219.118
+    User andrew.choi
+    Port 50022
+Host 1
+    HostName 39.106.85.150
+    User andrew.choi
+    Port 50022
+Host 2
+    HostName 39.107.81.216
+    User andrew.choi
+    Port 50022
+...
+```
+Then you download and upload data from **shared** folders from the cluster by leveraging the bandwidth of each individual server.
+
+```bash
+RSYNC_RSH="ssh -p 50022" prsync_c --parallel=8 --hosts="1" -avz andrew.choi@1:/data/datasets/openx/jaco_play/ jaco_play
+```
+
+
+
+## README from original author
+
 This script is a simple drop-in replacement for `rsync` for parallelising your data transfer.
 
 Rsync is the tool of choice for copying/syncing data between locations.

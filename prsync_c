@@ -1,0 +1,188 @@
+#!/bin/bash
+set -e
+# Inspired by https://gist.github.com/akorn/644855ddaa8065f564be
+# Usage:
+#   rsync_parallel.sh --parallel=N --hosts=START_INDEX [rsync args...]
+#
+# Options:
+#   --parallel=N         Use N parallel processes for transfer.
+#   --hosts=START_INDEX  Starting index for hosts. Will use hosts START_INDEX through START_INDEX+N-1.
+#
+# Notes:
+#   * Requires GNU Parallel
+#   * Assumes SSH keys are already configured for all hosts
+#   * Does an itemize-changes first, then chunks the resulting file list and launches N parallel
+#     rsyncs to transfer a chunk each.
+#   * be a little careful with the options you pass through to rsync. Normal ones will work, you
+#     might want to test weird options upfront.
+#   * Make sure your SSH config has the sequential hosts defined properly.
+#
+# Define colours for STDERR text
+RED='\033[0;31m'
+ORANGE='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+if ! command -v parallel &> /dev/null
+then
+  echo -e "${RED}parallel could not be found${NC}"
+  exit 1
+fi
+
+# Default parallel processes
+if [[ "$1" == --parallel=* ]]; then
+  PARALLEL_RSYNC="${1##*=}"
+  shift
+else
+  echo -e "${RED}ERROR: --parallel=N parameter is required${NC}"
+  exit 1
+fi
+
+# Process hosts starting index
+if [[ "$1" == --hosts=* ]]; then
+  HOST_START_INDEX="${1##*=}"
+  shift
+else
+  echo -e "${RED}ERROR: --hosts=START_INDEX parameter is required${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}INFO: Using up to ${PARALLEL_RSYNC} processes for transfer ...${NC}"
+echo -e "${GREEN}INFO: Using hosts ${HOST_START_INDEX} through $((HOST_START_INDEX + PARALLEL_RSYNC - 1)) ...${NC}"
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "${TMPDIR}"' EXIT
+echo -e "${GREEN}INFO: Determining file list for transfer ...${NC}"
+
+# sorted by size (descending)
+rsync "$@" --out-format="%l %n" --no-v --dry-run 2> /dev/null \
+  | grep -v "sending incremental file list" \
+  | sort --numeric-sort --reverse \
+  > "${TMPDIR}/files.all"
+
+# check for nothing-to-do
+TOTAL_FILES=$(wc -l < "${TMPDIR}/files.all")
+TOTAL_SIZE=$(awk '{ts+=$1}END{printf "%.0f", ts}' < "${TMPDIR}/files.all")
+echo -e "${GREEN}INFO: ${TOTAL_FILES} ($(( TOTAL_SIZE/1024**2 )) MB) files to transfer.${NC}"
+
+if [ "${TOTAL_FILES}" -eq "0" ]; then
+  echo -e "${ORANGE}WARN: Nothing to transfer :)${NC}"
+  exit 0
+fi
+
+function array_min {
+  ARR=("$@")
+  # Default index for min value
+  min_i=0
+  # Default min value
+  min_v=${ARR[$min_i]}
+  for i in "${!ARR[@]}"; do
+    v="${ARR[$i]}"
+    (( v < min_v )) && min_v=${v} && min_i=${i}
+  done
+  MIN_I="${min_i}"
+}
+
+echo -e "${GREEN}INFO: Distributing files among chunks ...${NC}"
+# declare chunk-size array
+for ((I = 0 ; I < PARALLEL_RSYNC ; I++ )); do
+  CHUNKS["${I}"]=0
+done
+
+# add each file to the emptiest chunk, so they're as balanced by size as possible
+PROGRESS=0
+SECONDS=0
+while read -r FSIZE FPATH; do
+  PROGRESS=$((PROGRESS+1))
+  array_min "${CHUNKS[@]}"
+  CHUNKS[MIN_I]=$(( CHUNKS[MIN_I] + FSIZE ))
+  echo "${FPATH}" >> "${TMPDIR}/chunk.${MIN_I}"
+  if ! ((PROGRESS % 25000)); then
+    >&2 echo -e "${GREEN}INFO: ${PROGRESS} of ${TOTAL_FILES} (${SECONDS}s)${NC}"
+  fi
+done < "${TMPDIR}/files.all"
+
+# Reverse the list of files in every other chunk for better transfer efficiency
+for ((I = 1 ; I < PARALLEL_RSYNC ; I+=2 )); do
+  # If the list of files to transfer is small, we may not have any files to work with
+  if [ ! -f "${TMPDIR}/chunk.${I}" ]; then
+    continue
+  fi
+
+  tac "${TMPDIR}/chunk.${I}" > "${TMPDIR}/chunk.${I}.r" && mv "${TMPDIR}/chunk.${I}.r" "${TMPDIR}/chunk.${I}"
+done
+echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
+
+echo -e "${GREEN}INFO: Starting transfers ...${NC}"
+
+# Extract information from source argument
+SOURCE_ARG=""
+DEST_ARG=""
+for arg in "$@"; do
+  if [[ "$arg" =~ : ]] && [[ -z "$SOURCE_ARG" ]]; then
+    SOURCE_ARG="$arg"
+  elif [[ -z "$SOURCE_ARG" ]]; then
+    # Not the source yet
+    :
+  elif [[ -z "$DEST_ARG" ]]; then
+    DEST_ARG="$arg"
+    break
+  fi
+done
+
+# If source argument not found, try to determine it from the position
+if [[ -z "$SOURCE_ARG" ]] && [[ $# -ge 2 ]]; then
+  SOURCE_ARG="${@: -2:1}"
+  DEST_ARG="${@: -1}"
+fi
+
+if [[ -z "$SOURCE_ARG" ]] || [[ -z "$DEST_ARG" ]]; then
+  echo -e "${RED}ERROR: Could not determine source and destination arguments${NC}"
+  exit 1
+fi
+
+# Extract path from source
+if [[ "$SOURCE_ARG" =~ ^([^@]+@)?([^:]+):(.+)$ ]]; then
+  if [[ -n "${BASH_REMATCH[1]}" ]]; then
+    SOURCE_USER="${BASH_REMATCH[1]%@}"
+  fi
+  SOURCE_HOST="${BASH_REMATCH[2]}"
+  SOURCE_PATH="${BASH_REMATCH[3]}"
+else
+  echo -e "${RED}ERROR: Could not parse source path. Format should be [user@]host:/path${NC}"
+  exit 1
+fi
+
+# Generate rsync commands for each chunk using sequential hosts
+CHUNK_FILES=($(find "${TMPDIR}" -type f -name "chunk.*"))
+for ((i=0; i<${#CHUNK_FILES[@]}; i++)); do
+  CHUNK_FILE="${CHUNK_FILES[$i]}"
+  # Calculate the host number based on the start index
+  CURRENT_HOST_NUM=$((HOST_START_INDEX + i))
+
+  # Build the rsync command
+  RSYNC_CMD=(rsync --files-from="${CHUNK_FILE}")
+
+  # Add other rsync options
+  for arg in "$@"; do
+    if [[ "$arg" != "$SOURCE_ARG" ]] && [[ "$arg" != "$DEST_ARG" ]]; then
+      RSYNC_CMD+=("$arg")
+    fi
+  done
+
+  # Add source and destination with the current sequential host
+  if [[ -n "$SOURCE_USER" ]]; then
+    RSYNC_CMD+=("${SOURCE_USER}@${CURRENT_HOST_NUM}:${SOURCE_PATH}" "${DEST_ARG}")
+  else
+    RSYNC_CMD+=("${CURRENT_HOST_NUM}:${SOURCE_PATH}" "${DEST_ARG}")
+  fi
+
+  # Execute rsync command
+  echo "${RSYNC_CMD[@]}"
+  "${RSYNC_CMD[@]}" &
+done
+
+# Wait for all background processes to finish
+wait
+
+echo -e "${GREEN}DONE (${SECONDS}s)${NC}"
