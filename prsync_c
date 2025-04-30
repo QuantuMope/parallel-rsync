@@ -1,12 +1,14 @@
 #!/bin/bash
 set -e
 # Usage:
-#   queue_rsync.sh --parallel=N --hosts=START_INDEX [--total_bw=MBPS] [rsync args...]
+#   queue_rsync.sh --parallel=N --hosts=START_INDEX [--total_bw=MBPS] [--batch_size=SIZE] [--files-from=FILE] [rsync args...]
 #
 # Options:
 #   --parallel=N         Use N parallel processes for transfer.
 #   --hosts=START_INDEX  Starting index for hosts. Will use hosts START_INDEX through START_INDEX+N-1.
 #   --total_bw=MBPS      Total bandwidth in Mbps to distribute across transfers (optional).
+#   --batch_size=SIZE    Number of files to process in each batch (optional, default=10).
+#   --files-from=FILE    File containing list of files to transfer (optional).
 #
 # Notes:
 #   * Requires GNU Parallel and flock for safe queue operations
@@ -63,8 +65,31 @@ if [[ "$1" == --total_bw=* ]]; then
   shift
 fi
 
+# Process batch size if provided
+BATCH_SIZE=10 # Default batch size
+if [[ "$1" == --batch_size=* ]]; then
+  BATCH_SIZE="${1##*=}"
+  shift
+fi
+
+# Process files-from if provided
+FILES_FROM=""
+if [[ "$1" == --files-from=* ]]; then
+  FILES_FROM="${1##*=}"
+  if [ ! -f "$FILES_FROM" ]; then
+    echo -e "${RED}ERROR: Files-from file '${FILES_FROM}' does not exist${NC}"
+    exit 1
+  fi
+  shift
+fi
+
 echo -e "${GREEN}INFO: Using up to ${PARALLEL_RSYNC} processes for transfer ...${NC}"
 echo -e "${GREEN}INFO: Using hosts ${HOST_START_INDEX} through $((HOST_START_INDEX + PARALLEL_RSYNC - 1)) ...${NC}"
+echo -e "${GREEN}INFO: Using batch size of ${BATCH_SIZE} files${NC}"
+
+if [ -n "$FILES_FROM" ]; then
+  echo -e "${GREEN}INFO: Using files list from: ${FILES_FROM}${NC}"
+fi
 
 if [ -n "$TOTAL_BW_MBPS" ]; then
   echo -e "${GREEN}INFO: Total bandwidth: ${TOTAL_BW_MBPS} Mbps (${TOTAL_BANDWIDTH} KB/s)${NC}"
@@ -145,12 +170,16 @@ trap 'rm -rf "${TMPDIR}"' EXIT
 echo -e "${GREEN}INFO: Determining file list for transfer ...${NC}"
 
 # For both upload and download, we need to get the file list
-if [ "$IS_UPLOAD" = true ]; then
-  # For upload, source is local
-  rsync "${RSYNC_OPTS[@]}" --out-format="%l %n" --no-v --dry-run "$SOURCE_ARG" "$DEST_ARG" 2> /dev/null \
-    | grep -v "sending incremental file list" \
-    | sort --numeric-sort --reverse \
-    > "${TMPDIR}/files.all"
+if [ -n "$FILES_FROM" ]; then
+  # Use the provided files-from file
+  # Sort by file size if possible (check if file has two columns: size and filename)
+  if grep -q "^[0-9]* " "$FILES_FROM"; then
+    # Files-from contains sizes, sort by size
+    sort --numeric-sort --reverse "$FILES_FROM" > "${TMPDIR}/files.all"
+  else
+    # Files-from contains only filenames, no sorting by size
+    cat "$FILES_FROM" > "${TMPDIR}/files.all"
+  fi
 else
   # For download, source is remote
   rsync "${RSYNC_OPTS[@]}" --out-format="%l %n" --no-v --dry-run "$SOURCE_ARG" "$DEST_ARG" 2> /dev/null \
@@ -161,17 +190,23 @@ fi
 
 # check for nothing-to-do
 TOTAL_FILES=$(wc -l < "${TMPDIR}/files.all")
-TOTAL_SIZE=$(awk '{ts+=$1}END{printf "%.0f", ts}' < "${TMPDIR}/files.all")
-echo -e "${GREEN}INFO: ${TOTAL_FILES} ($(( TOTAL_SIZE/1024**2 )) MB) files to transfer.${NC}"
+if [ -n "$FILES_FROM" ] && grep -q "^[0-9]* " "$FILES_FROM"; then
+  TOTAL_SIZE=$(awk '{ts+=$1}END{printf "%.0f", ts}' < "${TMPDIR}/files.all")
+  echo -e "${GREEN}INFO: ${TOTAL_FILES} files ($(( TOTAL_SIZE/1024**2 )) MB) to transfer.${NC}"
+else
+  echo -e "${GREEN}INFO: ${TOTAL_FILES} files to transfer.${NC}"
+fi
 
 if [ "${TOTAL_FILES}" -eq "0" ]; then
   echo -e "${ORANGE}WARN: Nothing to transfer :)${NC}"
   exit 0
 fi
 
-# Remove directories from files.all
-grep -v '/$' "${TMPDIR}/files.all" > "${TMPDIR}/files.filtered"
-mv "${TMPDIR}/files.filtered" "${TMPDIR}/files.all"
+# Remove directories from files.all if not using files-from
+if [ -z "$FILES_FROM" ]; then
+  grep -v '/$' "${TMPDIR}/files.all" > "${TMPDIR}/files.filtered"
+  mv "${TMPDIR}/files.filtered" "${TMPDIR}/files.all"
+fi
 
 # Ensure the destination directory exists only once
 if [ "$IS_UPLOAD" = true ]; then
@@ -213,8 +248,6 @@ worker_function() {
     REMOTE="${HOST_NUM}"
   fi
 
-  # Number of files to process in each batch (adjust as needed)
-  BATCH_SIZE=10
   TOTAL_PROCESSED=0
 
   while true; do
@@ -240,8 +273,13 @@ worker_function() {
     BATCH_COUNT=$(wc -l < "${BATCH_FILE}")
     TOTAL_PROCESSED=$((TOTAL_PROCESSED + BATCH_COUNT))
 
-    # Extract just the filenames (no sizes)
-    awk '{print $2}' "${BATCH_FILE}" > "${BATCH_FILE}.names"
+    # Extract just the filenames (no sizes) if needed
+    if grep -q "^[0-9]* " "${BATCH_FILE}"; then
+      awk '{print $2}' "${BATCH_FILE}" > "${BATCH_FILE}.names"
+    else
+      # Already just filenames
+      cp "${BATCH_FILE}" "${BATCH_FILE}.names"
+    fi
 
     # Build rsync command
     CMD="rsync --files-from=${BATCH_FILE}.names"
@@ -282,6 +320,7 @@ export LOCAL_ARG
 export IS_UPLOAD
 export REMOTE_USER
 export BANDWIDTH_PER_TRANSFER
+export BATCH_SIZE
 export GREEN
 RSYNC_OPTS_STR=$(declare -p RSYNC_OPTS)
 export RSYNC_OPTS_STR
